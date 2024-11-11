@@ -7,8 +7,6 @@ import random
 from typing import Tuple, Optional, List
 import time
 
-
-
 def heuristic(x1: int, y1: int, x2: int, y2: int) -> float:
     """
     Calcula la distancia euclidiana entre dos puntos.
@@ -23,7 +21,6 @@ def heuristic(x1: int, y1: int, x2: int, y2: int) -> float:
         float: Distancia euclidiana entre los puntos
     """
     return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-
 
 class MemoryManager:
     """Gestiona la memoria para el algoritmo A* en CUDA."""
@@ -42,10 +39,12 @@ class MemoryManager:
         self.max_gpu_memory = max_gpu_memory
         self.total_size = width * height
 
-       
         self.grid_size = self.total_size * np.int32().itemsize
         self.score_size = self.total_size * np.float32().itemsize
         self.bool_size = self.total_size * np.bool_().itemsize
+
+        # Añadir espacio para contador de estados
+        self.counter_size = np.int32().itemsize
 
         # Calcular tamaño total necesario
         self.total_memory_needed = (
@@ -53,7 +52,8 @@ class MemoryManager:
             2 * self.score_size +  
             2 * self.grid_size + 
             2 * self.bool_size +  
-            np.bool_().itemsize 
+            np.bool_().itemsize +
+            self.counter_size  # Espacio para contador de estados
         )
 
         # Determinar si necesitamos particionamiento
@@ -65,9 +65,10 @@ class MemoryManager:
         memory_per_cell = (
             np.int32().itemsize * 3 + 
             np.float32().itemsize * 2 +  
-            np.bool_().itemsize * 2  
+            np.bool_().itemsize * 2 +
+            np.int32().itemsize  # Incluir espacio para contador
         )
-        return (self.max_gpu_memory // memory_per_cell) // 2  
+        return (self.max_gpu_memory // memory_per_cell) // 2
 
     def allocate_memory(self) -> Tuple[dict, dict]:
         """
@@ -80,34 +81,31 @@ class MemoryManager:
         zero_copy_buffers = {}
 
         if self.needs_partitioning:
-            # Usar memoria zero-copy para arrays grandes
             zero_copy_buffers.update({
                 'grid': cuda.pagelocked_empty((self.height, self.width), np.int32),
                 'g_score': cuda.pagelocked_empty(self.total_size, np.float32),
                 'f_score': cuda.pagelocked_empty(self.total_size, np.float32)
             })
 
-            # Usar memoria GPU para particiones activas
             gpu_buffers.update({
                 'partition_grid': cuda.mem_alloc(self.partition_size * np.int32().itemsize),
                 'partition_g_score': cuda.mem_alloc(self.partition_size * np.float32().itemsize),
                 'partition_f_score': cuda.mem_alloc(self.partition_size * np.float32().itemsize)
             })
         else:
-            
             gpu_buffers.update({
                 'grid': cuda.mem_alloc(self.grid_size),
                 'g_score': cuda.mem_alloc(self.score_size),
                 'f_score': cuda.mem_alloc(self.score_size)
             })
 
-       
         gpu_buffers.update({
             'came_from_x': cuda.mem_alloc(self.grid_size),
             'came_from_y': cuda.mem_alloc(self.grid_size),
             'open_set': cuda.mem_alloc(self.bool_size),
             'closed_set': cuda.mem_alloc(self.bool_size),
-            'found': cuda.mem_alloc(np.bool_().itemsize)
+            'found': cuda.mem_alloc(np.bool_().itemsize),
+            'expanded_states': cuda.mem_alloc(np.int32().itemsize)  # Contador de estados expandidos
         })
 
         return gpu_buffers, zero_copy_buffers
@@ -123,13 +121,12 @@ class AStarCUDA:
         """
         self.grid = grid.astype(np.int32)
         self.height, self.width = grid.shape
-        self.heuristic = heuristic  
+        self.heuristic = heuristic
+        self.expanded_states = 0  # Contador de estados expandidos
 
-        
         self.memory_manager = MemoryManager(self.width, self.height, max_gpu_memory)
         self.gpu_buffers, self.zero_copy_buffers = self.memory_manager.allocate_memory()
 
-        
         self.mod = SourceModule("""
         __device__ float heuristic(int x1, int y1, int x2, int y2) {
             return sqrtf(powf(x2 - x1, 2.0f) + powf(y2 - y1, 2.0f));
@@ -151,7 +148,8 @@ class AStarCUDA:
             int *came_from_y,
             bool *open_set,
             bool *closed_set,
-            bool *found
+            bool *found,
+            int *expanded_states
         ) {
             int local_idx = blockIdx.x * blockDim.x + threadIdx.x;
             if (local_idx >= partition_size) return;
@@ -161,16 +159,17 @@ class AStarCUDA:
 
             if (!open_set[idx] || closed_set[idx]) return;
 
+            // Incrementar contador de estados expandidos
+            atomicAdd(expanded_states, 1);
+
             int x = idx % width;
             int y = idx / width;
 
-            // Verificar si llegamos al objetivo
             if (x == goal_x && y == goal_y) {
                 *found = true;
                 return;
             }
 
-            // Direcciones para vecinos (8 direcciones)
             int dx[8] = {-1, -1, -1,  0,  0,  1, 1, 1};
             int dy[8] = {-1,  0,  1, -1,  1, -1, 0, 1};
             float costs[8] = {1.414f, 1.0f, 1.414f, 1.0f, 1.0f, 1.414f, 1.0f, 1.414f};
@@ -212,7 +211,6 @@ class AStarCUDA:
         grid_size = (partition_size + block_size - 1) // block_size
 
         if self.memory_manager.needs_partitioning:
-            # Copiar datos de la partición actual
             partition_slice = slice(partition_start, partition_start + partition_size)
             cuda.memcpy_htod(self.gpu_buffers['partition_grid'],
                            self.zero_copy_buffers['grid'].ravel()[partition_slice])
@@ -246,12 +244,12 @@ class AStarCUDA:
             self.gpu_buffers['open_set'],
             self.gpu_buffers['closed_set'],
             self.gpu_buffers['found'],
+            self.gpu_buffers['expanded_states'],
             block=(block_size, 1, 1),
             grid=(grid_size, 1)
         )
 
         if self.memory_manager.needs_partitioning:
-            # Copiar resultados de vuelta a memoria zero-copy
             cuda.memcpy_dtoh(self.zero_copy_buffers['g_score'][partition_slice],
                            self.gpu_buffers['partition_g_score'])
             cuda.memcpy_dtoh(self.zero_copy_buffers['f_score'][partition_slice],
@@ -268,25 +266,27 @@ class AStarCUDA:
         Returns:
             Optional[List[Tuple[int, int]]]: Lista de coordenadas del camino o None si no hay camino
         """
+        # Inicializar contador de estados expandidos
+        expanded_states = np.zeros(1, dtype=np.int32)
+        cuda.memcpy_htod(self.gpu_buffers['expanded_states'], expanded_states)
         
         if self.memory_manager.needs_partitioning:
             self.zero_copy_buffers['g_score'].fill(np.inf)
             self.zero_copy_buffers['f_score'].fill(np.inf)
             start_idx = start[1] * self.width + start[0]
             self.zero_copy_buffers['g_score'][start_idx] = 0
-            self.zero_copy_buffers['f_score'][start_idx] = self.heuristic(*start, *goal)  
+            self.zero_copy_buffers['f_score'][start_idx] = self.heuristic(*start, *goal)
             cuda.memcpy_htod(self.gpu_buffers['grid'], self.grid)
         else:
             g_score = np.full(self.memory_manager.total_size, np.inf, dtype=np.float32)
             f_score = np.full(self.memory_manager.total_size, np.inf, dtype=np.float32)
             start_idx = start[1] * self.width + start[0]
             g_score[start_idx] = 0
-            f_score[start_idx] = self.heuristic(*start, *goal)  
+            f_score[start_idx] = self.heuristic(*start, *goal)
             cuda.memcpy_htod(self.gpu_buffers['grid'], self.grid)
             cuda.memcpy_htod(self.gpu_buffers['g_score'], g_score)
             cuda.memcpy_htod(self.gpu_buffers['f_score'], f_score)
 
-        
         open_set = np.zeros(self.memory_manager.total_size, dtype=np.bool_)
         closed_set = np.zeros(self.memory_manager.total_size, dtype=np.bool_)
         came_from_x = np.full(self.memory_manager.total_size, -1, dtype=np.int32)
@@ -299,7 +299,6 @@ class AStarCUDA:
         cuda.memcpy_htod(self.gpu_buffers['came_from_x'], came_from_x)
         cuda.memcpy_htod(self.gpu_buffers['came_from_y'], came_from_y)
 
-        # Procesar particiones
         found = np.array([False], dtype=np.bool_)
         max_iterations = self.width * self.height * 2
 
@@ -321,7 +320,12 @@ class AStarCUDA:
             if found[0] or not np.any(open_set):
                 break
 
-       # Reconstruir camino
+        # Obtener el número total de estados expandidos
+        expanded_states = np.zeros(1, dtype=np.int32)
+        cuda.memcpy_dtoh(expanded_states, self.gpu_buffers['expanded_states'])
+        self.expanded_states = int(expanded_states[0])
+
+        # Reconstruir camino
         cuda.memcpy_dtoh(came_from_x, self.gpu_buffers['came_from_x'])
         cuda.memcpy_dtoh(came_from_y, self.gpu_buffers['came_from_y'])
 
@@ -342,6 +346,15 @@ class AStarCUDA:
             current = (next_x, next_y)
         path.append(start)
         return path[::-1]
+
+    def get_expanded_states(self) -> int:
+        """
+        Retorna el número de estados expandidos durante la última búsqueda.
+
+        Returns:
+            int: Número de estados expandidos
+        """
+        return self.expanded_states
 
     def __del__(self):
         """Liberar recursos de GPU al destruir la instancia."""
@@ -415,21 +428,17 @@ def visualize_grid(grid: np.ndarray, path: Optional[List[Tuple[int, int]]] = Non
 def main():
     """Función principal para demostrar el uso del algoritmo."""
     
-    width, height = 2000, 2000  
+    width, height = 2000, 2000
     start = (0, 0)
     goal = (width-1, height-1)
-    max_gpu_memory = 128 * 1024 * 1024  
+    max_gpu_memory = 128 * 1024 * 1024
 
-   
     print("Generando grid...")
     grid = generate_random_obstacles(width, height, start, goal, obstacle_density=0.3)
 
-
-    
     print("Inicializando A* CUDA...")
     astar = AStarCUDA(grid, max_gpu_memory=max_gpu_memory)
 
-   
     print("Buscando camino...")
     start_time = time.time()
     path = astar.find_path(start, goal)
@@ -437,8 +446,8 @@ def main():
 
     elapsed_time = end_time - start_time
     print(f"Tiempo transcurrido: {elapsed_time} segundos")
+    print(f"Número de estados expandidos: {astar.get_expanded_states()}")
 
-    
     if path:
         print("\nCamino encontrado!")
         print(f"Longitud del camino: {len(path)}")
